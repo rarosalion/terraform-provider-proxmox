@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 	"github.com/stretchr/testify/require"
 
@@ -3098,7 +3099,7 @@ func TestAccResourceContainerNodeMigration(t *testing.T) {
 				template_file_id = "local:vztmpl/{{.ImageFileName}}"
 				type             = "alpine"
 			}
-		}`, WithRootUser())
+		}`)
 
 	resource.Test(t, resource.TestCase{
 		ProtoV6ProviderFactories: te.AccProviders,
@@ -3112,17 +3113,24 @@ func TestAccResourceContainerNodeMigration(t *testing.T) {
 			},
 			{
 				// Step 2: Migrate the container to the second node out-of-band (not through
-				// Terraform), then expect a plan with no changes at all. Before the fix, this
-				// step fails the test outright: PlanOnly asserts an empty plan by default, but
-				// the provider instead plans to create a brand new container, because
+				// Terraform), then expect an apply with no changes at all. Before the fix, this
+				// step fails outright: the pre-apply plan is expected to be empty, but the
+				// provider instead plans to create a brand new container, because
 				// containerRead's read at the stale node_name 404s and it drops the resource
-				// from state.
+				// from state. A real apply (not PlanOnly) is used deliberately, so the
+				// self-healed node_name is actually persisted to state - a PlanOnly step here
+				// would verify the plan but leave state pointing at the old node, which then
+				// breaks this test's own cleanup.
 				PreConfig: func() {
 					err := migrateContainer(t.Context(), te, accTestContainerID, te.Node2Name)
 					require.NoError(t, err, "failed to migrate container out-of-band")
 				},
-				Config:   containerConfig,
-				PlanOnly: true,
+				Config: containerConfig,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectEmptyPlan(),
+					},
+				},
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr(accTestContainerName, "node_name", te.Node2Name),
 				),
