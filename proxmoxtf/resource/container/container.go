@@ -25,6 +25,7 @@ import (
 
 	"github.com/bpg/terraform-provider-proxmox/proxmox"
 	"github.com/bpg/terraform-provider-proxmox/proxmox/api"
+	"github.com/bpg/terraform-provider-proxmox/proxmox/cluster"
 	"github.com/bpg/terraform-provider-proxmox/proxmox/helpers/ptr"
 	"github.com/bpg/terraform-provider-proxmox/proxmox/nodes/containers"
 	"github.com/bpg/terraform-provider-proxmox/proxmox/nodes/tasks"
@@ -2665,14 +2666,33 @@ func containerRead(ctx context.Context, d *schema.ResourceData, m any) diag.Diag
 		return diag.FromErr(e)
 	}
 
-	nodeName := d.Get(mkNodeName).(string)
-
 	vmID, e := strconv.Atoi(d.Id())
 	if e != nil {
 		return diag.FromErr(e)
 	}
 
-	containerAPI := client.Node(nodeName).Container(vmID)
+	// The container may have moved to a different node since the last read (HA migration,
+	// rebalancing, or a manual `pct migrate`). Resolve its current node from the cluster before
+	// reading it, and correct the stored node_name if it has drifted, so a stale node_name here
+	// doesn't cause a 404 that gets mistaken for the container being deleted.
+	nodeName, e := client.Cluster().GetVMNodeName(ctx, vmID)
+	if e != nil {
+		if errors.Is(e, cluster.ErrVMDoesNotExist) {
+			d.SetId("")
+			return nil
+		}
+
+		return diag.FromErr(e)
+	}
+
+	if *nodeName != d.Get(mkNodeName) {
+		e = d.Set(mkNodeName, *nodeName)
+		if e != nil {
+			return diag.FromErr(e)
+		}
+	}
+
+	containerAPI := client.Node(*nodeName).Container(vmID)
 
 	// Retrieve the entire configuration in order to compare it to the state.
 	containerConfig, e := containerAPI.GetContainer(ctx)

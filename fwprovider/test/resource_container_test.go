@@ -13,6 +13,7 @@ package test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
@@ -2999,6 +3000,132 @@ func TestAccResourceContainerFeaturesRefresh(t *testing.T) {
 				Config:             containerConfig,
 				PlanOnly:           true,
 				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
+// lxcMigrateRequestBody is the request body for `POST /nodes/{node}/lxc/{vmid}/migrate`.
+// The containers client does not wrap this endpoint yet (see issue #658, which this test
+// exists to cover), so the raw request is built here instead.
+type lxcMigrateRequestBody struct {
+	Target  string                  `json:"target"            url:"target"`
+	Restart proxmoxtypes.CustomBool `json:"restart"           url:"restart,int"`
+}
+
+// lxcMigrateResponseBody is the response body for the LXC migrate endpoint - a bare task UPID.
+type lxcMigrateResponseBody struct {
+	Data *string `json:"data,omitempty"`
+}
+
+// migrateContainer moves a container to targetNode using restart-mode migration (works
+// without shared storage) and waits for the migration task to finish.
+func migrateContainer(ctx context.Context, te *Environment, vmID int, targetNode string) error {
+	client := te.NodeClient().Container(vmID)
+
+	resBody := &lxcMigrateResponseBody{}
+
+	err := client.DoRequest(ctx, http.MethodPost, client.ExpandPath("migrate"), &lxcMigrateRequestBody{
+		Target:  targetNode,
+		Restart: proxmoxtypes.CustomBool(true),
+	}, resBody)
+	if err != nil {
+		return fmt.Errorf("error migrating container: %w", err)
+	}
+
+	if resBody.Data == nil {
+		return errors.New("no task ID returned by the container migrate endpoint")
+	}
+
+	return client.Tasks().WaitForTask(ctx, *resBody.Data).Err()
+}
+
+// TestAccResourceContainerNodeMigration verifies that containerRead tolerates a container
+// having moved to a different node outside Terraform (HA migration, cluster rebalancing, or
+// a manual `pct migrate`), the same way vmRead already does for VMs.
+//
+// Without the fix for issue #658, containerRead reads the container using the node_name
+// stored in state. Once the container is no longer there, that read 404s, and the provider
+// treats the container as deleted - the next plan wants to create a brand new one instead of
+// reporting the (otherwise harmless) node_name drift that `lifecycle { ignore_changes =
+// [node_name] }` is meant to let users tolerate, exactly as documented in the "HA clusters and
+// node_name drift" section of the multi-node guide.
+func TestAccResourceContainerNodeMigration(t *testing.T) {
+	te := InitEnvironment(t)
+
+	if te.Node2Name == "" {
+		t.Skip("PROXMOX_VE_ACC_NODE_2_NAME must be set")
+	}
+
+	imageFileName := fmt.Sprintf("%d-alpine-3.22-default_20250617_amd64.tar.xz", time.Now().UnixMicro())
+	testAccDownloadContainerTemplate(t, te, imageFileName)
+
+	accTestContainerID := 100000 + rand.Intn(99999)
+
+	te.AddTemplateVars(map[string]interface{}{
+		"ImageFileName":   imageFileName,
+		"TestContainerID": accTestContainerID,
+	})
+
+	containerConfig := te.RenderConfig(`
+		resource "proxmox_virtual_environment_container" "test_container" {
+			node_name    = "{{.NodeName}}"
+			vm_id        = {{.TestContainerID}}
+			unprivileged = true
+
+			# Tolerate the container being HA-managed and moving nodes outside Terraform -
+			# see the "HA clusters and node_name drift" section of the multi-node guide.
+			lifecycle {
+				ignore_changes = [node_name]
+			}
+
+			disk {
+				datastore_id = "local-lvm"
+				size         = 4
+			}
+			initialization {
+				hostname = "test-node-migration"
+				ip_config {
+					ipv4 {
+						address = "dhcp"
+					}
+				}
+			}
+			network_interface {
+				name = "vmbr0"
+			}
+			operating_system {
+				template_file_id = "local:vztmpl/{{.ImageFileName}}"
+				type             = "alpine"
+			}
+		}`, WithRootUser())
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: te.AccProviders,
+		Steps: []resource.TestStep{
+			{
+				// Step 1: Create the container on the primary test node.
+				Config: containerConfig,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(accTestContainerName, "node_name", te.NodeName),
+				),
+			},
+			{
+				// Step 2: Migrate the container to the second node out-of-band (not through
+				// Terraform), then expect a plan with no changes at all. Before the fix, this
+				// step fails the test outright: PlanOnly asserts an empty plan by default, but
+				// the provider instead plans to create a brand new container, because
+				// containerRead's read at the stale node_name 404s and it drops the resource
+				// from state.
+				PreConfig: func() {
+					err := migrateContainer(t.Context(), te, accTestContainerID, te.Node2Name)
+					require.NoError(t, err, "failed to migrate container out-of-band")
+				},
+				Config:   containerConfig,
+				PlanOnly: true,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(accTestContainerName, "node_name", te.Node2Name),
+				),
 			},
 		},
 	})
