@@ -2674,25 +2674,25 @@ func containerRead(ctx context.Context, d *schema.ResourceData, m any) diag.Diag
 	// The container may have moved to a different node since the last read (HA migration,
 	// rebalancing, or a manual `pct migrate`). Resolve its current node from the cluster before
 	// reading it, and correct the stored node_name if it has drifted, so a stale node_name here
-	// doesn't cause a 404 that gets mistaken for the container being deleted.
-	nodeName, e := client.Cluster().GetVMNodeName(ctx, vmID)
-	if e != nil {
-		if errors.Is(e, cluster.ErrVMDoesNotExist) {
-			d.SetId("")
-			return nil
-		}
-
+	// doesn't cause a 404 that gets mistaken for the container being deleted. A miss in the cluster
+	// resource list is not proof the container is gone, though: on a multi-node cluster the list can
+	// lag behind a container created moments ago. Fall through to the node config endpoint below,
+	// which is authoritative, instead of tainting here.
+	containerNodeName, e := client.Cluster().GetVMNodeName(ctx, vmID)
+	if e != nil && !errors.Is(e, cluster.ErrVMDoesNotExist) {
 		return diag.FromErr(e)
 	}
 
-	if *nodeName != d.Get(mkNodeName) {
-		e = d.Set(mkNodeName, *nodeName)
+	if containerNodeName != nil && *containerNodeName != d.Get(mkNodeName).(string) {
+		e = d.Set(mkNodeName, *containerNodeName)
 		if e != nil {
 			return diag.FromErr(e)
 		}
 	}
 
-	containerAPI := client.Node(*nodeName).Container(vmID)
+	nodeName := d.Get(mkNodeName).(string)
+
+	containerAPI := client.Node(nodeName).Container(vmID)
 
 	// Retrieve the entire configuration in order to compare it to the state.
 	containerConfig, e := containerAPI.GetContainer(ctx)

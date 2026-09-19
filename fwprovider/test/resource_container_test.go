@@ -28,6 +28,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 	"github.com/stretchr/testify/require"
 
+	"github.com/bpg/terraform-provider-proxmox/proxmox/api"
 	haresources "github.com/bpg/terraform-provider-proxmox/proxmox/cluster/ha/resources"
 	"github.com/bpg/terraform-provider-proxmox/proxmox/nodes/containers"
 	"github.com/bpg/terraform-provider-proxmox/proxmox/nodes/storage"
@@ -3133,6 +3134,71 @@ func TestAccResourceContainerNodeMigration(t *testing.T) {
 				},
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr(accTestContainerName, "node_name", te.Node2Name),
+				),
+			},
+		},
+	})
+}
+
+// TestAccResourceContainerReadSurvivesClusterListLag verifies that a container missing from the
+// cluster-wide resource list, as happens on a multi-node cluster right after creation, is still
+// read through its node's config endpoint instead of being dropped from state. Mirrors
+// TestAccResourceVMReadSurvivesClusterListLag in resource_vm_cluster_list_test.go.
+func TestAccResourceContainerReadSurvivesClusterListLag(t *testing.T) {
+	t.Parallel()
+
+	te := InitEnvironment(t)
+	imageFileName := fmt.Sprintf("%d-alpine-3.22-default_20250617_amd64.tar.xz", time.Now().UnixMicro())
+	testAccDownloadContainerTemplate(t, te, imageFileName)
+
+	accTestContainerID := 100000 + rand.Intn(99999)
+	te.AddTemplateVars(map[string]interface{}{
+		"ImageFileName":   imageFileName,
+		"TestContainerID": accTestContainerID,
+	})
+
+	t.Cleanup(func() {
+		err := te.NodeClient().Container(accTestContainerID).DeleteContainer(context.Background(), true, true).Err()
+		if err != nil && !errors.Is(err, api.ErrResourceDoesNotExist) {
+			t.Logf("cleanup: delete container %d: %v", accTestContainerID, err)
+		}
+	})
+
+	endpoint := newEmptyClusterListProxy(t)
+	resourceName := "proxmox_virtual_environment_container.test_cluster_list_lag"
+
+	resource.Test(t, resource.TestCase{
+		ProtoV6ProviderFactories: te.AccProviders,
+		Steps: []resource.TestStep{
+			{
+				Config: te.RenderConfig(`
+					resource "proxmox_virtual_environment_container" "test_cluster_list_lag" {
+						node_name    = "{{.NodeName}}"
+						vm_id        = {{.TestContainerID}}
+						unprivileged = true
+
+						disk {
+							datastore_id = "local-lvm"
+							size         = 4
+						}
+						initialization {
+							hostname = "test-cluster-list-lag"
+						}
+						network_interface {
+							name = "vmbr0"
+						}
+						operating_system {
+							template_file_id = "local:vztmpl/{{.ImageFileName}}"
+							type             = "alpine"
+						}
+					}`, WithInsecureEndpoint(endpoint)),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(resourceName, "id", strconv.Itoa(accTestContainerID)),
+					func(*terraform.State) error {
+						_, err := te.NodeClient().Container(accTestContainerID).GetContainer(context.Background())
+
+						return err
+					},
 				),
 			},
 		},
